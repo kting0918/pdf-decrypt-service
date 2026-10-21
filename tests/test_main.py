@@ -59,6 +59,14 @@ def client():
     return TestClient(main.app)
 
 
+@pytest.fixture(autouse=True)
+def reset_auth_failures():
+    # 認證失敗計數是模組層級狀態，每個測試前後清空，避免跨測試累積觸發鎖定
+    main._auth_failures.clear()
+    yield
+    main._auth_failures.clear()
+
+
 @pytest.fixture
 def auth_configured(monkeypatch):
     monkeypatch.setattr(main, "AUTH_USERNAME", TEST_USER)
@@ -136,7 +144,7 @@ def test_decrypt_wrong_password_returns_422(client, auth_configured, password):
         "/decrypt", auth=AUTH, files=pdf_file(pdf), data={"password": password}
     )
     assert r.status_code == 422
-    assert r.json()["detail"].startswith("Cannot open PDF")
+    assert r.json()["detail"] == "Cannot open PDF (wrong password or invalid file)"
 
 
 def test_decrypt_correct_password_returns_text_and_pages(client, auth_configured):
@@ -167,7 +175,7 @@ def test_decrypt_not_a_pdf_returns_422(client, auth_configured):
 # ── /render ──────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("scale", ["0", "-1", "4.01"])
+@pytest.mark.parametrize("scale", ["0", "-1", "4.01", "0.05", "1e-9", "nan", "inf", "-inf"])
 def test_render_scale_out_of_range_returns_400(client, auth_configured, scale):
     pdf = make_pdf(["x"], password=PDF_PASSWORD)
     r = client.post(
@@ -177,7 +185,21 @@ def test_render_scale_out_of_range_returns_400(client, auth_configured, scale):
         data={"password": PDF_PASSWORD, "scale": scale},
     )
     assert r.status_code == 400
-    assert r.json()["detail"] == "scale must be between 0 and 4"
+    assert r.json()["detail"] == "scale must be between 0.1 and 4"
+
+
+def test_render_scale_3_as_used_by_n8n(client, auth_configured):
+    # 信用卡帳單與永豐對帳單 workflow 實際送 scale=3
+    pdf = make_pdf(["p1"], password=PDF_PASSWORD)
+    r = client.post(
+        "/render",
+        auth=AUTH,
+        files=pdf_file(pdf),
+        data={"password": PDF_PASSWORD, "scale": "3", "extract_text": "true"},
+    )
+    assert r.status_code == 200
+    png = base64.b64decode(r.json()["images"][0])
+    assert int.from_bytes(png[16:20], "big") == 600
 
 
 def test_render_scale_4_returns_base64_png(client, auth_configured):
@@ -214,6 +236,113 @@ def test_render_wrong_password_returns_422(client, auth_configured):
         "/render", auth=AUTH, files=pdf_file(pdf), data={"password": "nope"}
     )
     assert r.status_code == 422
+
+
+# ── 資源上限 ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("endpoint", ["/decrypt", "/render"])
+def test_upload_too_large_returns_413(client, auth_configured, monkeypatch, endpoint):
+    pdf = make_pdf(["x"])
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", len(pdf) - 1)
+    r = client.post(endpoint, auth=AUTH, files=pdf_file(pdf))
+    assert r.status_code == 413
+    assert r.json()["detail"] == "File too large"
+
+
+def test_oversized_content_length_rejected_early(client, auth_configured, monkeypatch):
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 10)
+    r = client.post("/render", auth=AUTH, files=pdf_file(b"x" * 200_000))
+    assert r.status_code == 413
+
+
+@pytest.mark.parametrize("endpoint", ["/decrypt", "/render"])
+def test_too_many_pages_returns_413(client, auth_configured, monkeypatch, endpoint):
+    monkeypatch.setattr(main, "MAX_PAGES", 2)
+    r = client.post(endpoint, auth=AUTH, files=pdf_file(make_pdf(["a", "b", "c"])))
+    assert r.status_code == 413
+    assert r.json()["detail"] == "Too many pages (max 2)"
+
+
+def test_page_at_page_limit_ok(client, auth_configured, monkeypatch):
+    monkeypatch.setattr(main, "MAX_PAGES", 2)
+    r = client.post("/decrypt", auth=AUTH, files=pdf_file(make_pdf(["a", "b"])))
+    assert r.status_code == 200
+
+
+def test_page_pixel_limit_returns_413(client, auth_configured, monkeypatch):
+    # 200×200pt、scale 4 → 640,000 像素
+    monkeypatch.setattr(main, "MAX_PIXELS_PER_PAGE", 600_000)
+    r = client.post(
+        "/render", auth=AUTH, files=pdf_file(make_pdf(["x"])), data={"scale": "4"}
+    )
+    assert r.status_code == 413
+
+
+def test_server_busy_returns_503(client, auth_configured, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(main, "_job_slots", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(main, "JOB_QUEUE_TIMEOUT", 0.01)
+    main._job_slots.acquire()
+    try:
+        r = client.post("/render", auth=AUTH, files=pdf_file(make_pdf(["x"])))
+    finally:
+        main._job_slots.release()
+    assert r.status_code == 503
+
+
+def test_job_slot_released_after_error(client, auth_configured, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(main, "_job_slots", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(main, "JOB_QUEUE_TIMEOUT", 0.01)
+    bad = client.post("/decrypt", auth=AUTH, files=pdf_file(b"not a pdf"))
+    assert bad.status_code == 422
+    ok = client.post("/decrypt", auth=AUTH, files=pdf_file(make_pdf(["x"])))
+    assert ok.status_code == 200
+
+
+def test_error_detail_does_not_leak_internals(client, auth_configured):
+    r = client.post("/decrypt", auth=AUTH, files=pdf_file(b"not a pdf"))
+    assert r.json()["detail"] == "Cannot open PDF (wrong password or invalid file)"
+
+
+# ── 認證失敗鎖定 ─────────────────────────────────────────────────
+
+
+def test_auth_lockout_after_repeated_failures(client, auth_configured, monkeypatch):
+    monkeypatch.setattr(main, "AUTH_FAIL_LIMIT", 3)
+    for _ in range(3):
+        r = client.post("/decrypt", auth=("x", "y"), files=pdf_file(make_pdf(["x"])))
+        assert r.status_code == 401
+    # 鎖定後連正確帳密也擋
+    r = client.post("/decrypt", auth=AUTH, files=pdf_file(make_pdf(["x"])))
+    assert r.status_code == 429
+
+
+def test_auth_lockout_is_per_client_ip(client, auth_configured, monkeypatch):
+    monkeypatch.setattr(main, "AUTH_FAIL_LIMIT", 2)
+    attacker = {"CF-Connecting-IP": "203.0.113.9"}
+    for _ in range(2):
+        client.post("/decrypt", auth=("x", "y"), headers=attacker, files=pdf_file(make_pdf(["x"])))
+    blocked = client.post("/decrypt", auth=AUTH, headers=attacker, files=pdf_file(make_pdf(["x"])))
+    assert blocked.status_code == 429
+    legit = client.post(
+        "/decrypt", auth=AUTH, headers={"CF-Connecting-IP": "198.51.100.7"}, files=pdf_file(make_pdf(["x"]))
+    )
+    assert legit.status_code == 200
+
+
+def test_auth_lockout_expires(client, auth_configured, monkeypatch):
+    monkeypatch.setattr(main, "AUTH_FAIL_LIMIT", 1)
+    monkeypatch.setattr(main, "AUTH_FAIL_WINDOW", 0.05)
+    client.post("/decrypt", auth=("x", "y"), files=pdf_file(make_pdf(["x"])))
+    assert client.post("/decrypt", auth=AUTH, files=pdf_file(make_pdf(["x"]))).status_code == 429
+    import time
+
+    time.sleep(0.1)
+    assert client.post("/decrypt", auth=AUTH, files=pdf_file(make_pdf(["x"]))).status_code == 200
 
 
 # ── docs 關閉 ────────────────────────────────────────────────────
